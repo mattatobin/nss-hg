@@ -576,6 +576,9 @@ ssl3_DecodeHandshakeType(int msgType)
         case new_session_ticket:
             rv = "session_ticket (4)";
             break;
+        case end_of_early_data:
+            rv = "end_of_early_data (5)";
+            break;
         case hello_retry_request:
             rv = "hello_retry_request (6)";
             break;
@@ -3347,9 +3350,6 @@ ssl3_HandleAlert(sslSocket *ss, sslBuffer *buf)
         case bad_certificate_hash_value:
             error = SSL_ERROR_BAD_CERT_HASH_VALUE_ALERT;
             break;
-        case end_of_early_data:
-            error = SSL_ERROR_END_OF_EARLY_DATA_ALERT;
-            break;
         default:
             error = SSL_ERROR_RX_UNKNOWN_ALERT;
             break;
@@ -3361,7 +3361,6 @@ ssl3_HandleAlert(sslSocket *ss, sslBuffer *buf)
         switch (desc) {
             case close_notify:
             case user_canceled:
-            case end_of_early_data:
                 break;
             default:
                 level = alert_fatal;
@@ -3380,9 +3379,6 @@ ssl3_HandleAlert(sslSocket *ss, sslBuffer *buf)
         }
         PORT_SetError(error);
         return SECFailure;
-    }
-    if (desc == end_of_early_data) {
-        return tls13_HandleEndOfEarlyData(ss);
     }
     if ((desc == no_certificate) && (ss->ssl3.hs.ws == wait_client_cert)) {
         /* I'm a server. I've requested a client cert. He hasn't got one. */
@@ -6442,8 +6438,8 @@ ssl3_PickServerSignatureScheme(sslSocket *ss)
 
     /* Sets error code, if needed. */
     return ssl_PickSignatureScheme(ss, keyPair->pubKey, keyPair->privKey,
-                                   ss->xtnData.clientSigSchemes,
-                                   ss->xtnData.numClientSigScheme,
+                                   ss->xtnData.sigSchemes,
+                                   ss->xtnData.numSigSchemes,
                                    PR_FALSE /* requireSha1 */);
 }
 
@@ -7303,7 +7299,7 @@ typedef struct dnameNode {
  */
 SECStatus
 ssl3_ParseCertificateRequestCAs(sslSocket *ss, SSL3Opaque **b, PRUint32 *length,
-                                PLArenaPool *arena, CERTDistNames *ca_list)
+                                CERTDistNames *ca_list)
 {
     PRUint32 remaining;
     int nnames = 0;
@@ -7318,7 +7314,7 @@ ssl3_ParseCertificateRequestCAs(sslSocket *ss, SSL3Opaque **b, PRUint32 *length,
     if (remaining > *length)
         goto alert_loser;
 
-    ca_list->head = node = PORT_ArenaZNew(arena, dnameNode);
+    ca_list->head = node = PORT_ArenaZNew(ca_list->arena, dnameNode);
     if (node == NULL)
         goto no_mem;
 
@@ -7344,14 +7340,14 @@ ssl3_ParseCertificateRequestCAs(sslSocket *ss, SSL3Opaque **b, PRUint32 *length,
         if (remaining <= 0)
             break; /* success */
 
-        node->next = PORT_ArenaZNew(arena, dnameNode);
+        node->next = PORT_ArenaZNew(ca_list->arena, dnameNode);
         node = node->next;
         if (node == NULL)
             goto no_mem;
     }
 
     ca_list->nnames = nnames;
-    ca_list->names = PORT_ArenaNewArray(arena, SECItem, nnames);
+    ca_list->names = PORT_ArenaNewArray(ca_list->arena, SECItem, nnames);
     if (nnames > 0 && ca_list->names == NULL)
         goto no_mem;
 
@@ -7495,7 +7491,7 @@ ssl3_HandleCertificateRequest(sslSocket *ss, SSL3Opaque *b, PRUint32 length)
         }
     }
 
-    rv = ssl3_ParseCertificateRequestCAs(ss, &b, &length, arena, &ca_list);
+    rv = ssl3_ParseCertificateRequestCAs(ss, &b, &length, &ca_list);
     if (rv != SECSuccess)
         goto done; /* alert sent in ssl3_ParseCertificateRequestCAs */
 
@@ -9635,10 +9631,10 @@ ssl3_SendCertificateRequest(sslSocket *ss)
     const PRUint8 *certTypes;
     SECStatus rv;
     int length;
-    SECItem *names;
+    const SECItem *names;
     unsigned int calen;
     unsigned int nnames;
-    SECItem *name;
+    const SECItem *name;
     int i;
     int certTypesLength;
     PRUint8 sigAlgs[MAX_SIGNATURE_SCHEMES * 2];
@@ -10184,8 +10180,8 @@ ssl3_SendEmptyCertificate(sslSocket *ss)
     const SECItem *context;
 
     if (ss->version >= SSL_LIBRARY_VERSION_TLS_1_3) {
-        PORT_Assert(ss->ssl3.hs.certificateRequest);
-        context = &ss->ssl3.hs.certificateRequest->context;
+        PORT_Assert(ss->ssl3.hs.clientCertRequested);
+        context = &ss->xtnData.certReqContext;
         len = context->len + 1;
         isTLS13 = PR_TRUE;
     }
@@ -10414,8 +10410,8 @@ ssl3_SendCertificate(sslSocket *ss)
     if (isTLS13) {
         contextLen = 1; /* Size of the context length */
         if (!ss->sec.isServer) {
-            PORT_Assert(ss->ssl3.hs.certificateRequest);
-            context = ss->ssl3.hs.certificateRequest->context;
+            PORT_Assert(ss->ssl3.hs.clientCertRequested);
+            context = ss->xtnData.certReqContext;
             contextLen += context.len;
         }
     }
@@ -12889,7 +12885,6 @@ ssl3_InitState(sslSocket *ss)
     ss->ssl3.hs.serverHsTrafficSecret = NULL;
     ss->ssl3.hs.clientTrafficSecret = NULL;
     ss->ssl3.hs.serverTrafficSecret = NULL;
-    ss->ssl3.hs.certificateRequest = NULL;
     PR_INIT_CLIST(&ss->ssl3.hs.cipherSpecs);
 
     PORT_Assert(!ss->ssl3.hs.messages.buf && !ss->ssl3.hs.messages.space);
@@ -13230,11 +13225,6 @@ ssl3_DestroySSL3Info(sslSocket *ss)
 
     SECITEM_FreeItem(&ss->ssl3.hs.newSessionTicket.ticket, PR_FALSE);
     SECITEM_FreeItem(&ss->ssl3.hs.srvVirtName, PR_FALSE);
-
-    if (ss->ssl3.hs.certificateRequest) {
-        PORT_FreeArena(ss->ssl3.hs.certificateRequest->arena, PR_FALSE);
-        ss->ssl3.hs.certificateRequest = NULL;
-    }
 
     /* free up the CipherSpecs */
     ssl3_DestroyCipherSpec(&ss->ssl3.specs[0], PR_TRUE /*freeSrvName*/);
