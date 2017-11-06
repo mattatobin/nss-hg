@@ -170,7 +170,6 @@ TEST_F(AltHandshakeTest, ServerDisabledAfterZeroRtt) {
   client_->Set0RttEnabled(true);
   server_->Set0RttEnabled(true);
 
-  client_->ExpectSendAlert(kTlsAlertEndOfEarlyData);
   client_->Handshake();  // Send ClientHello (and CCS)
 
   server_->Handshake();  // Consume the ClientHello, which is OK.

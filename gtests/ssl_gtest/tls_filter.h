@@ -50,10 +50,10 @@ class TlsRecordHeader : public TlsVersioned {
 
   uint8_t content_type() const { return content_type_; }
   uint64_t sequence_number() const { return sequence_number_; }
-  size_t header_length() const { return is_dtls() ? 11 : 3; }
+  size_t header_length() const { return is_dtls() ? 13 : 5; }
 
   // Parse the header; return true if successful; body in an outparam if OK.
-  bool Parse(TlsParser* parser, DataBuffer* body);
+  bool Parse(uint64_t sequence_number, TlsParser* parser, DataBuffer* body);
   // Write the header and body to a buffer at the given offset.
   // Return the offset of the end of the write.
   size_t Write(DataBuffer* buffer, size_t offset, const DataBuffer& body) const;
@@ -71,7 +71,13 @@ struct TlsRecord {
 // Abstract filter that operates on entire (D)TLS records.
 class TlsRecordFilter : public PacketFilter {
  public:
-  TlsRecordFilter() : agent_(nullptr), count_(0), cipher_spec_() {}
+  TlsRecordFilter()
+      : agent_(nullptr),
+        count_(0),
+        cipher_spec_(),
+        dropped_record_(false),
+        in_sequence_number_(0),
+        out_sequence_number_(0) {}
 
   void SetAgent(const TlsAgent* agent) { agent_ = agent; }
   const TlsAgent* agent() const { return agent_; }
@@ -120,14 +126,21 @@ class TlsRecordFilter : public PacketFilter {
   const TlsAgent* agent_;
   size_t count_;
   std::unique_ptr<TlsCipherSpec> cipher_spec_;
+  // Whether we dropped a record since the cipher spec changed.
+  bool dropped_record_;
+  // The sequence number we use for reading records as they are written.
+  uint64_t in_sequence_number_;
+  // The sequence number we use for writing modified records.
+  uint64_t out_sequence_number_;
 };
 
-inline std::ostream& operator<<(std::ostream& stream, TlsVersioned v) {
+inline std::ostream& operator<<(std::ostream& stream, const TlsVersioned& v) {
   v.WriteStream(stream);
   return stream;
 }
 
-inline std::ostream& operator<<(std::ostream& stream, TlsRecordHeader& hdr) {
+inline std::ostream& operator<<(std::ostream& stream,
+                                const TlsRecordHeader& hdr) {
   hdr.WriteStream(stream);
   stream << ' ';
   switch (hdr.content_type()) {
@@ -144,8 +157,11 @@ inline std::ostream& operator<<(std::ostream& stream, TlsRecordHeader& hdr) {
     case kTlsApplicationDataType:
       stream << "Data";
       break;
+    case kTlsAckType:
+      stream << "ACK";
+      break;
     default:
-      stream << '<' << hdr.content_type() << '>';
+      stream << '<' << static_cast<int>(hdr.content_type()) << '>';
       break;
   }
   return stream << ' ' << std::hex << hdr.sequence_number() << std::dec;
@@ -203,6 +219,8 @@ class TlsInspectorRecordHandshakeMessage : public TlsHandshakeFilter {
                                                const DataBuffer& input,
                                                DataBuffer* output);
 
+  void Reset() { buffer_.Truncate(0); }
+
   const DataBuffer& buffer() const { return buffer_; }
 
  private:
@@ -226,6 +244,7 @@ class TlsInspectorReplaceHandshakeMessage : public TlsHandshakeFilter {
   DataBuffer buffer_;
 };
 
+// Make a copy of each record of a given type.
 class TlsRecordRecorder : public TlsRecordFilter {
  public:
   TlsRecordRecorder(uint8_t ct) : filter_(true), ct_(ct), records_() {}
@@ -273,7 +292,6 @@ class TlsHeaderRecorder : public TlsRecordFilter {
   std::vector<TlsRecordHeader> headers_;
 };
 
-// Runs multiple packet filters in series.
 typedef std::initializer_list<std::shared_ptr<PacketFilter>>
     ChainedPacketFilterInit;
 
@@ -304,10 +322,15 @@ class TlsExtensionFilter : public TlsHandshakeFilter {
   TlsExtensionFilter() : handshake_types_() {
     handshake_types_.insert(kTlsHandshakeClientHello);
     handshake_types_.insert(kTlsHandshakeServerHello);
+    handshake_types_.insert(kTlsHandshakeEncryptedExtensions);
   }
 
   TlsExtensionFilter(const std::set<uint8_t>& types)
       : handshake_types_(types) {}
+
+  void SetHandshakeTypes(const std::set<uint8_t>& types) {
+    handshake_types_ = types;
+  }
 
   static bool FindExtensions(TlsParser* parser, const HandshakeHeader& header);
 
@@ -371,6 +394,21 @@ class TlsExtensionDropper : public TlsExtensionFilter {
   uint16_t extension_;
 };
 
+class TlsExtensionInjector : public TlsHandshakeFilter {
+ public:
+  TlsExtensionInjector(uint16_t ext, const DataBuffer& data)
+      : extension_(ext), data_(data) {}
+
+ protected:
+  PacketFilter::Action FilterHandshake(const HandshakeHeader& header,
+                                       const DataBuffer& input,
+                                       DataBuffer* output) override;
+
+ private:
+  const uint16_t extension_;
+  const DataBuffer data_;
+};
+
 class TlsAgent;
 typedef std::function<void(void)> VoidFunction;
 
@@ -422,6 +460,42 @@ class SelectiveDropFilter : public PacketFilter {
   uint8_t counter_;
 };
 
+// This class selectively drops complete records. The difference from
+// SelectiveDropFilter is that if multiple DTLS records are in the same
+// datagram, we just drop one.
+class SelectiveRecordDropFilter : public TlsRecordFilter {
+ public:
+  SelectiveRecordDropFilter(uint32_t pattern, bool enabled = true)
+      : pattern_(pattern), counter_(0) {
+    if (!enabled) {
+      Disable();
+    }
+  }
+  SelectiveRecordDropFilter(std::initializer_list<size_t> records)
+      : SelectiveRecordDropFilter(ToPattern(records), true) {}
+
+  void Reset(uint32_t pattern) {
+    counter_ = 0;
+    PacketFilter::Enable();
+    pattern_ = pattern;
+  }
+
+  void Reset(std::initializer_list<size_t> records) {
+    Reset(ToPattern(records));
+  }
+
+ protected:
+  PacketFilter::Action FilterRecord(const TlsRecordHeader& header,
+                                    const DataBuffer& data,
+                                    DataBuffer* changed) override;
+
+ private:
+  static uint32_t ToPattern(std::initializer_list<size_t> records);
+
+  uint32_t pattern_;
+  uint8_t counter_;
+};
+
 // Set the version number in the ClientHello.
 class TlsInspectorClientHelloVersionSetter : public TlsHandshakeFilter {
  public:
@@ -454,6 +528,19 @@ class TlsLastByteDamager : public TlsHandshakeFilter {
 
  private:
   uint8_t type_;
+};
+
+class SelectedCipherSuiteReplacer : public TlsHandshakeFilter {
+ public:
+  SelectedCipherSuiteReplacer(uint16_t suite) : cipher_suite_(suite) {}
+
+ protected:
+  PacketFilter::Action FilterHandshake(const HandshakeHeader& header,
+                                       const DataBuffer& input,
+                                       DataBuffer* output) override;
+
+ private:
+  uint16_t cipher_suite_;
 };
 
 }  // namespace nss_test
