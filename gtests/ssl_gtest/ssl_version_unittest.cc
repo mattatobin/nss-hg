@@ -158,8 +158,7 @@ TEST_F(TlsConnectTest, DisallowSSLv3HelloWithTLSv13Enabled) {
 TEST_P(TlsConnectGeneric, AlertBeforeServerHello) {
   EnsureTlsSetup();
   client_->ExpectReceiveAlert(kTlsAlertUnrecognizedName, kTlsAlertWarning);
-  client_->StartConnect();
-  server_->StartConnect();
+  StartConnect();
   client_->Handshake();  // Send ClientHello.
   static const uint8_t kWarningAlert[] = {kTlsAlertWarning,
                                           kTlsAlertUnrecognizedName};
